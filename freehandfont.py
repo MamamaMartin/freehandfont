@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Freehandfont: turn photos of a filled-in template into an .otf font.
+"""Freehandfont: turn photos of handwritten letters into an .otf font.
 
+Letters written in rows on any paper:
+  python freehandfont.py cut IMG_1.jpg --pen blue --out work/regular                 # preview: boxes per glyph
+  python freehandfont.py cut IMG_1.jpg --pen blue --rows rows.txt --out work/regular # rows.txt: what each row says
+Or a printed sheet with a box per character:
   python freehandfont.py template --out work [--add "åäöÅÄÖ"] [--chars "Gq?"]
   python freehandfont.py extract work/template.json IMG_1.jpg IMG_2.jpg --pen blue --out work/regular
+Then:
   python freehandfont.py build work/regular --name "Ada Hand" --style Regular --out out
   python freehandfont.py proof out/AdaHand-Regular.otf out/proof.pdf
 """
@@ -155,11 +160,31 @@ def box_mean(d, box):
     return d[y0 + m:y1 - m, x0 + m:x1 - m].mean()
 
 
+def open_glyphs(folder):
+    """The glyph folder's glyphs.json: {'glyphs': {char: {file, baseline, units_per_px, photo, flags}}, 'x_ratio': ...}.
+    New runs merge into it, so a photo of just a few rewritten letters replaces only those."""
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, 'glyphs.json')
+    return json.load(open(path, encoding='utf-8')) if os.path.exists(path) else {'glyphs': {}}
+
+
+def save_glyph(meta, folder, ch, bmp, baseline, upx, photo, flags=()):
+    name = f'U+{ord(ch):04X}.png'
+    Image.fromarray(np.where(bmp, 0, 255).astype(np.uint8)).save(os.path.join(folder, name))
+    meta['glyphs'][ch] = {'file': name, 'baseline': round(float(baseline), 1), 'units_per_px': round(float(upx), 3),
+                          'photo': os.path.basename(photo), 'flags': list(flags)}
+
+
+def close_glyphs(meta, folder):
+    json.dump(meta, open(os.path.join(folder, 'glyphs.json'), 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    review(meta['glyphs'], folder)
+    print(f'{len(meta["glyphs"])} glyphs in {folder}: {"".join(meta["glyphs"])}')
+    print(f'contact sheet: {os.path.join(folder, "review.png")}')
+
+
 def cmd_extract(a):
     pages = json.load(open(a.template, encoding='utf-8'))['pages']
-    os.makedirs(a.out, exist_ok=True)
-    meta_path = os.path.join(a.out, 'glyphs.json')
-    glyphs = json.load(open(meta_path, encoding='utf-8'))['glyphs'] if os.path.exists(meta_path) else {}
+    meta = open_glyphs(a.out)
     channel = 0 if a.pen == 'green' else 1   # read ink in the channel the yellow guides don't show in
     for photo in a.photos:
         rgb = np.asarray(ImageOps.exif_transpose(Image.open(photo)).convert('RGB'))
@@ -183,17 +208,12 @@ def cmd_extract(a):
             if not crop.any():
                 continue
             edge = crop[0].any() or crop[-1].any() or crop[:, 0].any() or crop[:, -1].any()
-            name = f'U+{ord(ch):04X}.png'
-            Image.fromarray(np.where(crop, 0, 255).astype(np.uint8)).save(os.path.join(a.out, name))
-            glyphs[ch] = {'file': name, 'photo': os.path.basename(photo), 'flags': ['touches the box edge'] if edge else []}
+            save_glyph(meta, a.out, ch, crop, BASE - INNER, UPX, photo, ['touches the box edge'] if edge else [])
             got += 1
         print(f'{photo}: sheet {pid}, {got} characters')
-    json.dump({'baseline': BASE - INNER, 'units_per_px': UPX, 'glyphs': glyphs},
-              open(meta_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
-    review(glyphs, a.out)
-    missing = [c for c in dict.fromkeys(''.join(pages.values())) if c not in glyphs]
-    flagged = [c for c, g in glyphs.items() if g['flags']]
-    print(f'{len(glyphs)} glyphs in {a.out}. Contact sheet: {os.path.join(a.out, "review.png")}')
+    close_glyphs(meta, a.out)
+    missing = [c for c in dict.fromkeys(''.join(pages.values())) if c not in meta['glyphs']]
+    flagged = [c for c, g in meta['glyphs'].items() if g['flags']]
     print('missing:', ''.join(missing) or 'none')
     print('touching the box edge (may be cut off):', ''.join(flagged) or 'none')
 
@@ -209,11 +229,192 @@ def review(glyphs, folder, T=150, cols=12):
         scale = min((T - 10) / g.width, (T - 34) / g.height)
         g = g.resize((round(g.width * scale), round(g.height * scale)))
         im.paste(g.convert('RGB'), (x + 5, y + 30))
-        by = y + 30 + (BASE - INNER) * scale
+        by = y + 30 + glyphs[ch]['baseline'] * scale
         d.line([x + 5, by, x + 5 + g.width, by], fill=(150, 190, 255), width=1)
         d.text((x + 5, y + 3), ch, fill='red' if glyphs[ch]['flags'] else 'black', font=f)
         d.rectangle([x, y, x + T - 1, y + T - 1], outline=(220, 220, 220))
     im.save(os.path.join(folder, 'review.png'))
+
+
+# ---------- cut: letters written in rows on any paper, no template ----------
+
+CAP_UNITS = 700                      # cap height in font units; small letters keep the writer's own proportion
+CAP_REF, X_REF = 'ABCDEFGHIKLMNOPRSTUVWXYZ', 'acemnorsuvwxz'
+SKIP = '□'                           # in a rows file: a blob to leave out (a scribble, a crossed-out letter)
+
+
+def ink_mask(rgb, pen):
+    """(ink, ruled lines). Ink is dark and pen-coloured; ruled lines are whatever forms long horizontal runs
+    (blue notebook lines look like blue ink by colour alone)."""
+    a = rgb.astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    d = darkness(a.mean(2))
+    dark = d > 35
+    if pen == 'blue':
+        m = dark & (b - (r + g) / 2 > 12)
+    elif pen == 'red':
+        m = dark & (r - (g + b) / 2 > 20)
+    elif pen == 'green':
+        m = dark & (g - (r + b) / 2 > 12)
+    else:
+        m = dark.copy()
+    thick = ndi.binary_dilation(dark, np.ones((7, 1), bool))  # so a slightly tilted line still makes one long run
+    L = a.shape[1] // 12
+    runs = ndi.uniform_filter1d(thick.astype(float), L, axis=1) > 0.9
+    runs = (ndi.uniform_filter1d(runs.astype(float), L, axis=1) > 0) & thick  # extend to the line's ends
+    strong = 0.6 * np.percentile(d[m], 90) if m.any() else 0
+    m &= ~(runs & (d < strong))  # printed lines are lighter than pen ink, so ink crossing a line stays
+    lines = dark & ~m
+    above, below = np.zeros_like(m), np.zeros_like(m)
+    for k in range(1, 10):  # refill ruled-line pixels with ink just above and below: a stroke crossing the line
+        above[k:] |= m[:-k]
+        below[:-k] |= m[k:]
+    m |= ndi.binary_dilation(lines) & above & below
+    return ndi.binary_opening(ndi.binary_closing(m, np.ones((5, 5))), np.ones((3, 3))), lines
+
+
+def line_spacing(lines):
+    """Distance between ruled lines in px, or None on blank paper."""
+    w = lines.shape[1]
+    prof = lines[:, max(0, w // 2 - 150):w // 2 + 150].mean(1)
+    peaks = [i for i in range(2, len(prof) - 2) if prof[i] > 0.3 and prof[i] == prof[i - 2:i + 3].max()]
+    peaks = [p for k, p in enumerate(peaks) if k == 0 or p - peaks[k - 1] > 10]
+    if len(peaks) < 3:
+        return None
+    d = np.diff(peaks)
+    return float(np.median(d[d > np.median(d) * 0.6]))
+
+
+def cx(b): return (b['x0'] + b['x1']) / 2
+def cy(b): return (b['y0'] + b['y1']) / 2
+
+
+def group(blist, h, gap):
+    """Blobs -> glyphs, left to right. Join a blob to the previous glyph when one mostly overlaps the other in x
+    (i and its dot, ä and its dots, = and %), or when they are close and either side by side at the same height
+    (the two strokes of H, the marks of ") or one is a dot (!). f followed by a low g stays two glyphs."""
+    groups = []
+    for b in sorted(blist, key=lambda b: b['x0']):
+        g = groups[-1] if groups else None
+        if g:
+            hs = sorted([g['y1'] - g['y0'], b['y1'] - b['y0']])
+            x_overlap = min(g['x1'], b['x1']) - max(g['x0'], b['x0'])
+            y_overlap = min(g['y1'], b['y1']) - max(g['y0'], b['y0'])
+            close = b['x0'] - g['x1'] <= gap * h
+            join = (x_overlap >= 0.4 * min(g['x1'] - g['x0'], b['x1'] - b['x0']) or
+                    close and (y_overlap >= 0.7 * hs[0] or hs[0] < 0.3 * h))
+        if g and join:
+            g['ids'] += b['ids']
+            g['x1'], g['y0'], g['y1'] = max(g['x1'], b['x1']), min(g['y0'], b['y0']), max(g['y1'], b['y1'])
+        else:
+            groups.append(dict(b, ids=list(b['ids'])))
+    return groups
+
+
+def find_rows(m, gap):
+    """Ink -> rows (top to bottom) -> glyphs (left to right). Returns (labels, rows, typical letter height)."""
+    lab, n = ndi.label(m)
+    areas = ndi.sum(m, lab, range(1, n + 1))
+    bl = [dict(ids=[i], y0=s[0].start, y1=s[0].stop, x0=s[1].start, x1=s[1].stop, area=areas[i - 1])
+          for i, s in enumerate(ndi.find_objects(lab), 1) if areas[i - 1] >= 30]
+    if not bl:
+        return lab, [], 0
+    med = np.median([b['area'] for b in bl])
+    h = float(np.median([b['y1'] - b['y0'] for b in bl if b['area'] >= med]))
+    rows = []  # rows from letter-sized blobs only; a new row starts where their centres jump down
+    for b in sorted((b for b in bl if b['y1'] - b['y0'] >= 0.5 * h), key=cy):
+        if rows and cy(b) - cy(rows[-1][-1]) < 0.5 * h:
+            rows[-1].append(b)
+        else:
+            rows.append([b])
+    def fit(r):
+        return np.polyfit([cx(b) for b in r], [cy(b) for b in r], 1) if len(r) >= 3 else (0, np.median([cy(b) for b in r]))
+    fits = [fit(r) for r in rows]
+    for i in sorted(range(len(rows)), key=lambda i: len(rows[i])):  # a row of 1-2 low marks (",") next to a real row
+        if len(rows[i]) < 3 and len(rows) > 1:
+            dist = [np.median([abs(cy(b) - (k * cx(b) + c)) for b in rows[i]]) if j != i and rows[j] else np.inf
+                    for j, (k, c) in enumerate(fits)]
+            j = int(np.argmin(dist))
+            if dist[j] < h:
+                rows[j] += rows[i]
+                rows[i] = []
+                fits[j] = fit(rows[j])
+    rows = [r for r in rows if r]
+    fits = [fit(r) for r in rows]
+    members = [[] for _ in rows]
+    for b in bl:  # every blob, dots and commas too, joins the nearest row (following its tilt)
+        dist = [abs(cy(b) - (k * cx(b) + c)) for k, c in fits]
+        i = int(np.argmin(dist))
+        if dist[i] < 1.2 * h:
+            members[i].append(b)
+    return lab, [group(r, h, gap) for r in members], h
+
+
+def preview(m, rows, path):
+    """Ink with a numbered box per glyph and a label per row, for checking what each row says."""
+    s = min(1, 1600 / max(m.shape))
+    im = Image.fromarray(np.where(m, 0, 255).astype(np.uint8)).resize((round(m.shape[1] * s), round(m.shape[0] * s))).convert('RGB')
+    d, f = ImageDraw.Draw(im), ui_font(18)
+    colours = [(220, 50, 50), (30, 110, 230), (20, 150, 70), (200, 110, 0)]
+    for r, groups in enumerate(rows):
+        c = colours[r % len(colours)]
+        for i, g in enumerate(groups):
+            d.rectangle([g['x0'] * s, g['y0'] * s, g['x1'] * s, g['y1'] * s], outline=c, width=2)
+            d.text((g['x0'] * s, g['y1'] * s + 2), str(i), fill=c, font=f)
+        if groups:
+            d.text((max(2, groups[0]['x0'] * s - 90), groups[0]['y0'] * s), f'row {r}', fill=c, font=f)
+    im.save(path)
+
+
+def cmd_cut(a):
+    im = ImageOps.exif_transpose(Image.open(a.photo)).convert('RGB')
+    if a.rotate:
+        im = im.rotate(-a.rotate, expand=True, fillcolor='white')
+    m, lines = ink_mask(np.asarray(im), a.pen)
+    lab, rows, h = find_rows(m, a.gap)
+    meta = open_glyphs(a.out)
+    pv = os.path.join(a.out, f'preview-{os.path.splitext(os.path.basename(a.photo))[0]}.png')
+    preview(m, rows, pv)
+    print(f'{a.photo}: {len(rows)} rows, glyphs per row {[len(r) for r in rows]}. Preview: {pv}')
+    if not a.rows:
+        return
+    texts = open(a.rows, encoding='utf-8').read().rstrip('\n').split('\n')
+    if len(texts) > len(rows):
+        raise SystemExit(f'{a.rows} has {len(texts)} lines but the photo has {len(rows)} rows')
+    pairs = []
+    for r, (text, groups) in enumerate(zip(texts, rows)):
+        if text and len(text) != len(groups):
+            print(f'row {r}: found {len(groups)} glyphs but "{text}" has {len(text)} characters; row skipped')
+        elif text:
+            pairs += [(ch, g, r) for ch, g in zip(text, groups) if ch != SKIP]
+
+    # size from the letters themselves, so photos taken from different distances match
+    caps = [g['y1'] - g['y0'] for ch, g, _ in pairs if ch in CAP_REF]
+    xs = [g['y1'] - g['y0'] for ch, g, _ in pairs if ch in X_REF]
+    sp = line_spacing(lines)
+    if caps and xs:
+        meta['x_ratio'] = float(np.median(xs) / np.median(caps))
+    if caps:
+        upx = CAP_UNITS / np.median(caps)
+    elif xs:
+        upx = CAP_UNITS * meta.get('x_ratio', 0.6) / np.median(xs)
+    elif sp and 'line_units' in meta:   # punctuation only: fall back to the ruled lines as a ruler
+        upx = meta['line_units'] / sp
+    else:
+        raise SystemExit('nothing to measure the size from: add a few capitals or small letters (n, o, x) to this photo')
+    if sp and (caps or xs):
+        meta['line_units'] = sp * upx
+
+    for r in sorted({r for _, _, r in pairs}):
+        items = [(ch, g) for ch, g, rr in pairs if rr == r]
+        ref = [(cx(g), g['y1']) for ch, g in items if (ch.isalnum() and ch not in 'gjpqyQJçÇ') or ch in '.!?:']
+        ref = ref or [(cx(g), g['y1']) for _, g in items]
+        k, c0 = np.polyfit(*zip(*ref), 1) if len(ref) >= 3 else (0, np.median([y for _, y in ref]))
+        for ch, g in items:
+            pad = 10
+            sl = (slice(max(0, g['y0'] - pad), g['y1'] + pad), slice(max(0, g['x0'] - pad), g['x1'] + pad))
+            save_glyph(meta, a.out, ch, np.isin(lab[sl], g['ids']), k * cx(g) + c0 - sl[0].start, upx, a.photo)
+    close_glyphs(meta, a.out)
 
 
 # ---------- build ----------
@@ -275,11 +476,16 @@ def cmd_build(a):
     from fontTools.pens.t2CharStringPen import T2CharStringPen
     from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
     meta = json.load(open(os.path.join(a.glyphs, 'glyphs.json'), encoding='utf-8'))
-    upx, sb, bold = meta['units_per_px'], a.sidebearing, a.style.lower() == 'bold'
+    sb, bold = a.sidebearing, a.style.lower() == 'bold'
     order, cmap, charstrings, metrics, prof = ['.notdef', 'space'], {}, {}, {}, {}
     for ch, g in meta['glyphs'].items():
-        m, pad = smooth(np.asarray(Image.open(os.path.join(a.glyphs, g['file'])).convert('L')) < 128)
-        base = meta['baseline'] + pad
+        bmp = np.asarray(Image.open(os.path.join(a.glyphs, g['file'])).convert('L')) < 128
+        upx, base = g['units_per_px'], g['baseline']
+        f = upx / 5  # resample so every glyph traces at ~5 units per px, whatever the photo's resolution
+        if abs(f - 1) > 0.2:
+            bmp, base, upx = ndi.zoom(bmp.astype(float), f, order=1) > 0.5, base * f, upx / f
+        m, pad = smooth(bmp)
+        base += pad
         ys, xs = np.nonzero(m)
         xmin, xmax = xs.min(), xs.max()
         fx = lambda p: (round((p.x - xmin) * upx + sb), round((base - p.y) * upx))
@@ -341,21 +547,27 @@ def cmd_proof(a):
                         for r in ps.PairValueRecord:
                             kern[first, r.SecondGlyph] = r.Value1.XAdvance
 
-    def line(d, x, y, text, size):  # Pillow's basic layout ignores GPOS, so apply kerning by hand
-        f, prev = ImageFont.truetype(a.font, size), None
-        for ch in text:
-            g = cmap.get(ord(ch), 'space')
-            if prev:
-                x += kern.get((prev, g), 0) * size / 1000
-            d.text((x, y), ch, font=f, fill=0)
-            x += hmtx[g][0] * size / 1000
-            prev = g
+    def line(d, y, text, size, x0=40, right=1960):
+        """Draw text with kerning applied by hand (Pillow's basic layout ignores GPOS), wrapping at spaces.
+        Returns the y below the last line."""
+        f, x, prev = ImageFont.truetype(a.font, size), x0, None
+        for word in text.split(' '):
+            gs = [cmap.get(ord(ch), 'space') for ch in word]
+            width = sum(hmtx[g][0] for g in gs) * size / 1000
+            if x > x0 and x + width > right:
+                x, y, prev = x0, y + size * 1.7, None
+            for ch, g in zip(word, gs):
+                x += kern.get((prev, g), 0) * size / 1000 if prev else 0
+                d.text((x, y), ch, font=f, fill=0)
+                x, prev = x + hmtx[g][0] * size / 1000, g
+            x, prev = x + hmtx['space'][0] * size / 1000, None
+        return y + size * 1.7
 
     chars = [chr(c) for c in sorted(cmap) if c > 32 and c != 160]
     PW, cell = 2000, 110
     cols = PW // cell
     rows = -(-len(chars) // cols)
-    im = Image.new('L', (PW, 60 + rows * cell + 110 * (len(PROOF_LINES) + 1) + 60), 255)
+    im = Image.new('L', (PW, 60 + rows * cell + 3000), 255)  # cropped to what was drawn
     d, small = ImageDraw.Draw(im), ui_font(18)
     glyph_font = ImageFont.truetype(a.font, 72)
     for i, ch in enumerate(chars):
@@ -364,8 +576,8 @@ def cmd_proof(a):
         d.text((x + 20, y + 10), ch, font=glyph_font, fill=0)
     y = 60 + rows * cell
     for text in [PAIRS] + PROOF_LINES:
-        line(d, 40, y, text, 64)
-        y += 110
+        y = line(d, y, text, 64)
+    im = im.crop((0, 0, PW, int(y) + 20))
     im.save(a.out)
     missing = sorted({c for c in PAIRS + ''.join(PROOF_LINES) if c != ' ' and ord(c) not in cmap})
     print('wrote', a.out, '| not in the font:', ''.join(missing) or 'none')
@@ -383,6 +595,14 @@ def main():
     e.add_argument('photos', nargs='+')
     e.add_argument('--pen', default='blue', help='pen colour: blue, black, red, green (default blue)')
     e.add_argument('--out', required=True, help='glyph folder, one per weight; later photos replace earlier ones')
+    c = sub.add_parser('cut', help='cut letters out of a photo of rows written on any paper (no template)')
+    c.add_argument('photo')
+    c.add_argument('--pen', default='blue', help='pen colour: blue, black, red, green (default blue)')
+    c.add_argument('--rows', help='text file, one line per row with the characters in order; '
+                                  f'{SKIP} skips a blob, an empty line skips a row. Leave out to only get the preview')
+    c.add_argument('--rotate', type=int, default=0, help='turn the photo this many degrees clockwise first')
+    c.add_argument('--gap', type=float, default=0.25, help='join blobs closer than this x letter height (default 0.25)')
+    c.add_argument('--out', required=True, help='glyph folder, one per weight; new letters replace old ones')
     b = sub.add_parser('build', help='trace the glyphs into an .otf')
     b.add_argument('glyphs')
     b.add_argument('--name', required=True)
@@ -393,7 +613,7 @@ def main():
     r.add_argument('font')
     r.add_argument('out', help='.pdf, .jpg or .png')
     a = p.parse_args()
-    {'template': cmd_template, 'extract': cmd_extract, 'build': cmd_build, 'proof': cmd_proof}[a.cmd](a)
+    {'template': cmd_template, 'extract': cmd_extract, 'cut': cmd_cut, 'build': cmd_build, 'proof': cmd_proof}[a.cmd](a)
 
 
 if __name__ == '__main__':

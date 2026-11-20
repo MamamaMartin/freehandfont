@@ -57,6 +57,28 @@ def main():
     tt = TTFont(font)
     assert all(ord(c) in tt.getBestCmap() for c in chars)
     run('proof', font, os.path.join(work, 'out', 'proof.jpg'))
+
+    # freehand: rows on ruled paper, no template, a scribble to skip, photo taken sideways and a little tilted
+    rows = ['ABCDEFGH', 'abcdefgh', 'ij!?:%"']
+    paper = Image.new('RGB', (2400, 1500), (238, 236, 230))
+    d, pen = ImageDraw.Draw(paper), ff.ui_font(150)
+    for y in range(120, 1500, 200):
+        d.line([0, y, 2400, y], fill=(150, 160, 175), width=4)
+    for r, text in enumerate(rows):
+        for i, ch in enumerate(text + '#'):
+            xy = (150 + i * 240, 320 + r * 400)
+            if ch == '#':
+                d.ellipse([xy[0], xy[1] - 110, xy[0] + 110, xy[1]], fill=(30, 50, 160))  # scribble
+            else:
+                d.text(xy, ch, font=pen, fill=(30, 50, 160), anchor='ls')
+    tilted = paper.rotate(2, fillcolor=(238, 236, 230)).crop((60, 60, 2340, 1440))  # close-up: lines run off the frame
+    tilted.rotate(90, expand=True).save(os.path.join(work, 'free.jpg'))
+    open(os.path.join(work, 'rows.txt'), 'w', encoding='utf-8').write('\n'.join(t + ff.SKIP for t in rows))
+    out = os.path.join(work, 'free')
+    run('cut', os.path.join(work, 'free.jpg'), '--rotate', '90', '--rows', os.path.join(work, 'rows.txt'), '--out', out)
+    glyphs = json.load(open(os.path.join(out, 'glyphs.json'), encoding='utf-8'))['glyphs']
+    assert set(glyphs) == set(''.join(rows)), f'got {"".join(glyphs)}'
+    run('build', out, '--name', 'Free Hand', '--out', os.path.join(work, 'out'))
     print('ok', work)
 
 

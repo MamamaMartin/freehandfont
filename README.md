@@ -1,21 +1,36 @@
 # Freehandfont
 
-Turn your handwriting into a real font you can install and type with. You need a pen, a printer and a phone.
+Turn your handwriting into a real font you can install and type with. All you need is a pen, some paper and your phone.
 
-It's a [Claude Code](https://claude.com/claude-code) skill. Type `/freehandfont` and Claude walks you through it: print a sheet, fill it in, send photos, get `.otf` files back. The script also works on its own from the command line.
+![My handwriting as a font](examples/proof-regular.png)
+
+It's a [Claude Code](https://claude.com/claude-code) skill. Type `/freehandfont` and Claude walks you through it: write the alphabet, send photos, get `.otf` files back.
 
 ## How it works
 
-1. **Template.** A printable sheet with a box for each character. Boxes and lines are yellow, with black squares in the corners.
-2. **Reads the photos.** It finds the corner squares, straightens the page and reads the ink. Yellow doesn't show in the green channel, so the printed lines drop out on their own.
-3. **Cuts out each letter.** Every box has the same size and baseline, so letters from different photos come out the same size.
-4. **Checks what's missing.** It lists empty boxes and letters touching the box edge, and makes a contact sheet to check by eye. You redo just those characters on a short retry sheet.
-5. **Builds the font.** It traces each letter into curves and writes an `.otf` with spacing and kerning. You get Regular, and Bold too if you fill in a second sheet with a thicker pen.
-6. **Proof sheet.** Every glyph plus tricky pairs like "AV" and "To", so you can see spacing problems before you install.
-7. **Install steps** for Mac, Windows and the web (`@font-face`).
+**1. Write.** Capitals, small letters, digits and punctuation, in rows, on any paper. Ruled is fine. Leave a little space between characters. Then take a close-up photo or two.
 
-**In:** 1 to 3 photos per weight, a font name, the pen colour.
-**Out:** `Name-Regular.otf`, optionally `Name-Bold.otf`, `proof.pdf` or a JPG, and a CSS snippet.
+![The photo I started from](examples/photo-closeup.jpg)
+
+A whole page works too, crossed-out bits and all:
+
+<img src="examples/photo-page.jpg" alt="A full notebook page of letters" width="420">
+
+**2. Cut.** The script finds the ink (it ignores the ruled lines), groups it into rows and boxes every character. Claude looks at the boxes and says which letter is which. Scribbles and specks get skipped.
+
+![Every character boxed and numbered](examples/preview.png)
+
+**3. Check.** It lists what's missing or looks off. You rewrite just those on any scrap of paper and send one more photo.
+
+**4. Build.** Every letter is traced into curves and sized from your own capitals and small letters, so photos taken from different distances still match. You get an `.otf` with spacing and kerning. Write a second set with a thicker pen and you get Bold too.
+
+![The Bold weight](examples/proof-bold.png)
+
+**5. Proof.** A sheet with every glyph and tricky pairs like "AV" and "To", so you can see spacing problems before you install.
+
+**6. Use it.** Install steps for Mac and Windows, and a `@font-face` snippet for the web.
+
+![The font in use](examples/sample.png)
 
 ## Install the skill
 
@@ -29,14 +44,14 @@ Then type `/freehandfont` in Claude Code.
 
 ```bash
 pip install -r requirements.txt
-python freehandfont.py template --out work --add "åäöÅÄÖ"
-# print work/sheet-0.pdf, fill it in with a pen, take a photo
-python freehandfont.py extract work/template.json photo.jpg --pen blue --out work/regular
+python freehandfont.py cut photo.jpg --pen blue --out work/regular
+# open work/regular/preview-photo.png and write rows.txt: one line per row, the characters in order
+python freehandfont.py cut photo.jpg --pen blue --rows rows.txt --out work/regular
 python freehandfont.py build work/regular --name "My Hand" --out out
 python freehandfont.py proof out/MyHand-Regular.otf out/proof.pdf
 ```
 
-`python test_roundtrip.py` runs the whole pipeline on a fake photo.
+Prefer to print? `python freehandfont.py template --out work` makes a sheet with a box for each character, and `extract` reads it without a rows file. `python test_roundtrip.py` checks both routes on fake photos.
 
 ## Why
 
