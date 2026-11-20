@@ -1,0 +1,6 @@
+numpy
+scipy
+pillow>=10.1
+pillow-heif
+fonttools
+potracer
