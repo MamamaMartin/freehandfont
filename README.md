@@ -8,13 +8,9 @@ It's a [Claude Code](https://claude.com/claude-code) skill. Type `/freehandfont`
 
 ## How it works
 
-**1. Write.** Capitals, small letters, digits and punctuation, in rows, on any paper. Ruled is fine. Leave a little space between characters. Then take a close-up photo or two.
+**1. Write.** Capitals, small letters, digits and punctuation, in rows, on any paper. Ruled is fine. Leave a little space between characters. Then take a photo or two. Crossed-out bits are fine.
 
-![The photo I started from](examples/photo-closeup.jpg)
-
-A whole page works too, crossed-out bits and all:
-
-<img src="examples/photo-page.jpg" alt="A full notebook page of letters" width="420">
+<img src="examples/photo-page.jpg" alt="The notebook page I started from" width="420">
 
 **2. Cut.** The script finds the ink (it ignores the ruled lines), groups it into rows and boxes every character. Claude looks at the boxes and says which letter is which. Scribbles and specks get skipped.
 
